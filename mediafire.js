@@ -26,7 +26,15 @@
          * @type {string}
          * @private
          */
-        this._API_VERSION = options.apiVersion || '';
+        this._API_VERSION = options.apiVersion || '1.1';
+
+        /**
+         * Token version to use (default is 2)
+         * @constant
+         * @type {number}
+         * @private
+         */
+        this._TOKEN_VERSION = options.tokenVersion && options.tokenVersion < 3 ? options.tokenVersion : 2;
 
         /**
          * Path to the MediaFire API
@@ -34,7 +42,7 @@
          * @type {string}
          * @private
          */
-        this._API_PATH = '//mediafire.com/api/';
+        this._API_PATH = '//www.mediafire.com/api/';
 
         /**
          * Application ID
@@ -56,6 +64,27 @@
          * @private
          */
         this._sessionToken = '';
+
+        /**
+         * Number of v2 Session Tokens to storen (default is 3, max is 6)
+         * @type {object}
+         * @private
+         */
+        this._v2SessionTokensNum = options.tokensStored && options.tokensStored<7 ? options.tokensStored : 3;
+
+        /**
+         * API v2 Session Tokens
+         * @type {object}
+         * @private
+         */
+        this._v2SessionTokens = [];
+
+        /**
+         * API request queue
+         * @type {object}
+         * @private
+         */
+        this._requestQueue = [];
 
         /**
          * Uploader instance
@@ -139,12 +168,44 @@
          */
         this._get = function(url, params, callback, scope) {
             // Create XHR
-            var xhr = new XMLHttpRequest();
+            var xhr = new XMLHttpRequest(),
+                oThis = this;
 
             // Make sure params exists
             if(!params) {
                 params = {};
             }
+            
+            // Augment parameters
+            params.response_format = 'json';
+            if(this._TOKEN_VERSION == 1 && this._sessionToken) { 
+                // v1 session token
+                params.session_token = this._sessionToken;
+            }else if(this._TOKEN_VERSION == 2){ 
+                // v2 session token
+                var session = this._getAvailableSessionToken();
+                if(session){ // v2 session token found
+                    xhr.session = session;
+                    params = session.authenticateParams(url, params);
+                }else{ // v2 session token not found
+                    if(this._v2SessionTokens.length>0){ // make sure we actually have some v2 session tokens to choose from
+                        this._requestQueue.push({
+                            qUrl: url,
+                            qParams: params,
+                            qCallback: callback,
+                            qScope: scope
+                        });
+                        return;
+                    }else{ // we haven't gotten any v2 session tokens yet, just use a v1 for now
+                        params.session_token = this._sessionToken;
+                    }
+                }
+            }
+
+            // Construct parameters
+            url += '?' + Object.keys(params).map(function(key) {
+                return encodeURIComponent(key) + '=' + encodeURIComponent(params[key]);
+            }).join('&');
 
             // Handle callbacks
             xhr.onreadystatechange = function() {
@@ -154,6 +215,17 @@
                     if (xhr.status === 200) {
                         // Success
                         if(callback.success) {
+                            // handle v2 session token on return
+                            if(oThis._TOKEN_VERSION == 2){ 
+                                // Secret key needs to be updated
+                                if(response.response.new_key === 'yes' && this.session) {
+                                    this.session.updateSecret();
+                                // A new session was created
+                                } else if(response.response.secret_key) {
+                                    var newSession = new Session(response.response);
+                                    oThis._v2SessionTokens.push(newSession);
+                                }
+                            }
                             callback.success.call(scope, response, xhr);
                         }
                     } else {
@@ -162,19 +234,9 @@
                             callback.error.call(scope, response, xhr);
                         }
                     }
+                    oThis._processQueue();
                 }
             };
-
-            // Augment parameters
-            if(this._sessionToken) {
-                params.session_token = this._sessionToken;
-            }
-            params.response_format = 'json';
-
-            // Construct parameters
-            url += '?' + Object.keys(params).map(function(key) {
-                return encodeURIComponent(key) + '=' + encodeURIComponent(params[key]);
-            }).join('&');
 
             // Send request
             xhr.open('GET', url, true);
@@ -190,6 +252,48 @@
             var options = {type: 'upload', lifespan: 1440};
             var versionPath = this._API_VERSION ? this._API_VERSION + '/' : '';
             this._get(this._API_PATH + versionPath + 'user/get_action_token.php', options, this._parseCallback(callback), this);
+        };
+
+        /**
+         * Find an available v2 session token (returns Session object or false)
+         * @private
+         */
+        this._getAvailableSessionToken = function(callback) {
+            for (var i = 0, len = this._v2SessionTokens.length; i < len; i++) {
+                var session = this._v2SessionTokens[i];
+                // Found an available session, stop looking and mark this one unavailable
+                if(session.available) {
+                    session.available = false;
+                    return session;
+                }
+            }
+            return false;
+        };
+
+        /**
+         * If any calls in queue, run them
+         * @private
+         */
+        this._processQueue = function() {
+            if(this._requestQueue.length>0){
+                var req = this._requestQueue[0];
+                this._get(req.qUrl, req.qParams, req.qCallback, req.qScope);
+                this._requestQueue.splice(0,1);
+            }
+        };
+
+        /**
+         * If any calls in queue, run them
+         * @private
+         */
+        this._getV2SessionTokens = function() {
+            if(this._sessionToken && this._v2SessionTokens.length == 0){
+                var versionPath = this._API_VERSION ? this._API_VERSION + '/' : '';
+                for(var x=0; x<this._v2SessionTokensNum; x++){ // get 6 v2 session tokens
+                    // Send upgrade session token request
+                    this._get('https:' + this._API_PATH + versionPath + 'user/upgrade_session_token.php', {}, {success:function(){}}, this);
+                }
+            }
         };
     }
 
@@ -212,6 +316,9 @@
         /** @this MediaFire */
         var saveToken = function(data) {
             oThis._sessionToken = data.response.session_token;
+            if(oThis._TOKEN_VERSION == 2){
+                oThis._getV2SessionTokens();
+            }
         };
 
         // Inject internal success callback
@@ -243,12 +350,13 @@
         var versionPath = this._API_VERSION ? this._API_VERSION + '/' : '';
         this._get('https:' + this._API_PATH + versionPath + 'user/get_session_token.php', credentials, callback, this);
 
-        // Renew session token every 6 minutes.
-        var self = this;
-        setInterval(function() {
-            self._renew.call(self);
-        }, 6 * 60 * 1000);
-
+        // If using v1 session token, renew session token every 6 minutes.
+        if(this._TOKEN_VERSION == 1){
+            var self = this;
+            setInterval(function() {
+                self._renew.call(self);
+            }, 6 * 60 * 1000);
+        }
         return this;
     };
 
@@ -323,6 +431,109 @@
 
         return this;
     };    
+    
+    
+    /**
+     * Represents a Version 2 Session Token.
+     * @constructor
+     * @private
+     */
+    function Session(data) {
+        this.sessionToken = data.session_token;
+        this.secretKey = data.secret_key;
+        this.initTime = data.time;
+        this.available = true;
+        
+        /*
+         *  Creates URL for the purposes of creating a v2 session token signature
+         */
+        this._createUrl = function(url, params, forceRelative) {
+            // returns array of keys from given object
+            var sortedKeys = function(obj) {
+                var keys = [];
+                for (var key in obj) {
+                    if (obj.hasOwnProperty(key)) {
+                        keys.push(key);
+                    }
+                }
+                return keys;
+            };
+            
+            // function to iterate through object and run function (iterator)
+            var forEachSorted = function(obj, iterator, context) {
+                var keys = sortedKeys(obj);
+                for (var i = 0; i < keys.length; i++) {
+                    iterator.call(context, obj[keys[i]], keys[i]);
+                }
+                return keys;
+            };
+            
+            if(forceRelative && url.indexOf('mediafire.com') !== -1) {
+                url = url.split('mediafire.com').pop();
+            }
+    
+            if(!params) {
+                return url;
+            }
+    
+            var parts = [];
+            forEachSorted(params, function (value, key) {
+                if(value === null || value === undefined) {
+                    return;
+                }
+                if(typeof value === 'object') {
+                    value = JSON.stringify(value);
+                }
+                parts.push(encodeURIComponent(key) + '=' + encodeURIComponent(value));
+            });
+    
+            return url + ((url.indexOf('?') === -1) ? '?' : '&') + parts.join('&');
+        };
+        
+        /*
+         * JavaScript MD5 1.0.1
+         * https://github.com/blueimp/JavaScript-MD5
+         *
+         * Copyright 2011, Sebastian Tschan
+         * https://blueimp.net
+         *
+         * Licensed under the MIT license:
+         * http://www.opensource.org/licenses/MIT
+         * 
+         * Based on
+         * A JavaScript implementation of the RSA Data Security, Inc. MD5 Message
+         * Digest Algorithm, as defined in RFC 1321.
+         * Version 2.2 Copyright (C) Paul Johnston 1999 - 2009
+         * Other contributors: Greg Holt, Andrew Kepert, Ydnar, Lostinet
+         * Distributed under the BSD License
+         * See http://pajhome.org.uk/crypt/md5 for more info.
+         */
+        !function(a){"use strict";function b(a,b){var c=(65535&a)+(65535&b),d=(a>>16)+(b>>16)+(c>>16);return d<<16|65535&c}function c(a,b){return a<<b|a>>>32-b}function d(a,d,e,f,g,h){return b(c(b(b(d,a),b(f,h)),g),e)}function e(a,b,c,e,f,g,h){return d(b&c|~b&e,a,b,f,g,h)}function f(a,b,c,e,f,g,h){return d(b&e|c&~e,a,b,f,g,h)}function g(a,b,c,e,f,g,h){return d(b^c^e,a,b,f,g,h)}function h(a,b,c,e,f,g,h){return d(c^(b|~e),a,b,f,g,h)}function i(a,c){a[c>>5]|=128<<c%32,a[(c+64>>>9<<4)+14]=c;var d,i,j,k,l,m=1732584193,n=-271733879,o=-1732584194,p=271733878;for(d=0;d<a.length;d+=16)i=m,j=n,k=o,l=p,m=e(m,n,o,p,a[d],7,-680876936),p=e(p,m,n,o,a[d+1],12,-389564586),o=e(o,p,m,n,a[d+2],17,606105819),n=e(n,o,p,m,a[d+3],22,-1044525330),m=e(m,n,o,p,a[d+4],7,-176418897),p=e(p,m,n,o,a[d+5],12,1200080426),o=e(o,p,m,n,a[d+6],17,-1473231341),n=e(n,o,p,m,a[d+7],22,-45705983),m=e(m,n,o,p,a[d+8],7,1770035416),p=e(p,m,n,o,a[d+9],12,-1958414417),o=e(o,p,m,n,a[d+10],17,-42063),n=e(n,o,p,m,a[d+11],22,-1990404162),m=e(m,n,o,p,a[d+12],7,1804603682),p=e(p,m,n,o,a[d+13],12,-40341101),o=e(o,p,m,n,a[d+14],17,-1502002290),n=e(n,o,p,m,a[d+15],22,1236535329),m=f(m,n,o,p,a[d+1],5,-165796510),p=f(p,m,n,o,a[d+6],9,-1069501632),o=f(o,p,m,n,a[d+11],14,643717713),n=f(n,o,p,m,a[d],20,-373897302),m=f(m,n,o,p,a[d+5],5,-701558691),p=f(p,m,n,o,a[d+10],9,38016083),o=f(o,p,m,n,a[d+15],14,-660478335),n=f(n,o,p,m,a[d+4],20,-405537848),m=f(m,n,o,p,a[d+9],5,568446438),p=f(p,m,n,o,a[d+14],9,-1019803690),o=f(o,p,m,n,a[d+3],14,-187363961),n=f(n,o,p,m,a[d+8],20,1163531501),m=f(m,n,o,p,a[d+13],5,-1444681467),p=f(p,m,n,o,a[d+2],9,-51403784),o=f(o,p,m,n,a[d+7],14,1735328473),n=f(n,o,p,m,a[d+12],20,-1926607734),m=g(m,n,o,p,a[d+5],4,-378558),p=g(p,m,n,o,a[d+8],11,-2022574463),o=g(o,p,m,n,a[d+11],16,1839030562),n=g(n,o,p,m,a[d+14],23,-35309556),m=g(m,n,o,p,a[d+1],4,-1530992060),p=g(p,m,n,o,a[d+4],11,1272893353),o=g(o,p,m,n,a[d+7],16,-155497632),n=g(n,o,p,m,a[d+10],23,-1094730640),m=g(m,n,o,p,a[d+13],4,681279174),p=g(p,m,n,o,a[d],11,-358537222),o=g(o,p,m,n,a[d+3],16,-722521979),n=g(n,o,p,m,a[d+6],23,76029189),m=g(m,n,o,p,a[d+9],4,-640364487),p=g(p,m,n,o,a[d+12],11,-421815835),o=g(o,p,m,n,a[d+15],16,530742520),n=g(n,o,p,m,a[d+2],23,-995338651),m=h(m,n,o,p,a[d],6,-198630844),p=h(p,m,n,o,a[d+7],10,1126891415),o=h(o,p,m,n,a[d+14],15,-1416354905),n=h(n,o,p,m,a[d+5],21,-57434055),m=h(m,n,o,p,a[d+12],6,1700485571),p=h(p,m,n,o,a[d+3],10,-1894986606),o=h(o,p,m,n,a[d+10],15,-1051523),n=h(n,o,p,m,a[d+1],21,-2054922799),m=h(m,n,o,p,a[d+8],6,1873313359),p=h(p,m,n,o,a[d+15],10,-30611744),o=h(o,p,m,n,a[d+6],15,-1560198380),n=h(n,o,p,m,a[d+13],21,1309151649),m=h(m,n,o,p,a[d+4],6,-145523070),p=h(p,m,n,o,a[d+11],10,-1120210379),o=h(o,p,m,n,a[d+2],15,718787259),n=h(n,o,p,m,a[d+9],21,-343485551),m=b(m,i),n=b(n,j),o=b(o,k),p=b(p,l);return[m,n,o,p]}function j(a){var b,c="";for(b=0;b<32*a.length;b+=8)c+=String.fromCharCode(a[b>>5]>>>b%32&255);return c}function k(a){var b,c=[];for(c[(a.length>>2)-1]=void 0,b=0;b<c.length;b+=1)c[b]=0;for(b=0;b<8*a.length;b+=8)c[b>>5]|=(255&a.charCodeAt(b/8))<<b%32;return c}function l(a){return j(i(k(a),8*a.length))}function m(a,b){var c,d,e=k(a),f=[],g=[];for(f[15]=g[15]=void 0,e.length>16&&(e=i(e,8*a.length)),c=0;16>c;c+=1)f[c]=909522486^e[c],g[c]=1549556828^e[c];return d=i(f.concat(k(b)),512+8*b.length),j(i(g.concat(d),640))}function n(a){var b,c,d="0123456789abcdef",e="";for(c=0;c<a.length;c+=1)b=a.charCodeAt(c),e+=d.charAt(b>>>4&15)+d.charAt(15&b);return e}function o(a){return unescape(encodeURIComponent(a))}function p(a){return l(o(a))}function q(a){return n(p(a))}function r(a,b){return m(o(a),o(b))}function s(a,b){return n(r(a,b))}function t(a,b,c){return b?c?r(b,a):s(b,a):c?p(a):q(a)}"function"==typeof define&&define.amd?define(function(){return t}):a.md5=t}(this);
+        // usage Session.md5(string, key, raw) // key and raw are optional
+    }
+    
+    /**
+     * Updates a the secret key of a Session.
+     */
+    Session.prototype.updateSecret = function() {
+        this.available = true;
+        this.secretKey = (this.secretKey * 16807) % 2147483647;
+    };
+    
+    /**
+     * Updates a the secret key of a Session.
+     * @param {string} url of http request
+     * @param {object} params
+     */
+    Session.prototype.authenticateParams = function(requestUrl, params) {
+        // Append session token first, it's used in url verification
+        params.session_token = this.sessionToken;
+        // Build url exactly how it will be sent
+        var url = this._createUrl(requestUrl, params, true);
+        // Append signature hash
+        params.signature = this.md5((this.secretKey % 256) + this.initTime + url);
+        return params;
+    };
 
     window.MF = MediaFire;
 })();
