@@ -1,0 +1,11 @@
+{
+  "name": "mediafire-javascript-sdk",
+  "description": "MediaFire's Javascript SDK",
+  "version": "0.0.0",
+  "author": "http://www.mediafire.com/",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lexoyo/mediafire-javascript-sdk.git"
+  },
+  "license": "Apache License, Version 2.0"
+}
